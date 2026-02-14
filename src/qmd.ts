@@ -65,7 +65,17 @@ import {
   createStore,
   getDefaultDbPath,
 } from "./store.js";
-import { disposeDefaultLlamaCpp, withLLMSession, pullModels, DEFAULT_EMBED_MODEL_URI, DEFAULT_GENERATE_MODEL_URI, DEFAULT_RERANK_MODEL_URI, DEFAULT_MODEL_CACHE_DIR } from "./llm.js";
+import {
+  disposeDefaultLlamaCpp,
+  withLLMSession,
+  pullModels,
+  DEFAULT_EMBED_MODEL_URI,
+  DEFAULT_GENERATE_MODEL_URI,
+  DEFAULT_RERANK_MODEL_URI,
+  DEFAULT_MODEL_CACHE_DIR,
+  withApiRuntimeConfig,
+  getDefaultLlamaCpp,
+} from "./llm.js";
 import {
   formatSearchResults,
   formatDocuments,
@@ -82,6 +92,7 @@ import {
   listAllContexts,
   setConfigIndexName,
 } from "./collections.js";
+import { updateCollections as runIndexerUpdateCollections, embedVectors as runIndexerEmbedVectors } from "./indexer.js";
 
 // Enable production mode - allows using default database path
 // Tests must set INDEX_PATH or use createStore() with explicit path
@@ -366,72 +377,21 @@ function showStatus(): void {
 }
 
 async function updateCollections(): Promise<void> {
-  const db = getDb();
-  // Collections are defined in YAML; no duplicate cleanup needed.
-
-  // Clear Ollama cache on update
-  clearCache(db);
-
-  const collections = listCollections(db);
-
-  if (collections.length === 0) {
-    console.log(`${c.dim}No collections found. Run 'qmd collection add .' to index markdown files.${c.reset}`);
-    closeDb();
-    return;
-  }
-
-  // Don't close db here - indexFiles will reuse it and close at the end
-  console.log(`${c.bold}Updating ${collections.length} collection(s)...${c.reset}\n`);
-
-  for (let i = 0; i < collections.length; i++) {
-    const col = collections[i];
-    if (!col) continue;
-    console.log(`${c.cyan}[${i + 1}/${collections.length}]${c.reset} ${c.bold}${col.name}${c.reset} ${c.dim}(${col.glob_pattern})${c.reset}`);
-
-    // Execute custom update command if specified in YAML
-    const yamlCol = getCollectionFromYaml(col.name);
-    if (yamlCol?.update) {
-      console.log(`${c.dim}    Running update command: ${yamlCol.update}${c.reset}`);
-      try {
-        const proc = Bun.spawn(["/usr/bin/env", "bash", "-c", yamlCol.update], {
-          cwd: col.pwd,
-          stdout: "pipe",
-          stderr: "pipe",
-        });
-
-        const output = await new Response(proc.stdout).text();
-        const errorOutput = await new Response(proc.stderr).text();
-        const exitCode = await proc.exited;
-
-        if (output.trim()) {
-          console.log(output.trim().split('\n').map(l => `    ${l}`).join('\n'));
-        }
-        if (errorOutput.trim()) {
-          console.log(errorOutput.trim().split('\n').map(l => `    ${l}`).join('\n'));
-        }
-
-        if (exitCode !== 0) {
-          console.log(`${c.yellow}✗ Update command failed with exit code ${exitCode}${c.reset}`);
-          process.exit(exitCode);
-        }
-      } catch (err) {
-        console.log(`${c.yellow}✗ Update command failed: ${err}${c.reset}`);
-        process.exit(1);
-      }
-    }
-
-    await indexFiles(col.pwd, col.glob_pattern, col.name, true);
-    console.log("");
-  }
-
-  // Check if any documents need embedding (show once at end)
-  const finalDb = getDb();
-  const needsEmbedding = getHashesNeedingEmbedding(finalDb);
   closeDb();
-
-  console.log(`${c.green}✓ All collections updated.${c.reset}`);
-  if (needsEmbedding > 0) {
-    console.log(`\nRun 'qmd embed' to update embeddings (${needsEmbedding} unique hashes need vectors)`);
+  try {
+    const result = await runIndexerUpdateCollections({
+      dbPath: getDbPath(),
+      logger: {
+        info: (message: string) => console.log(message),
+        warn: (message: string) => console.log(`${c.yellow}${message}${c.reset}`),
+      },
+    });
+    if (result.collectionsUpdated === 0) {
+      console.log(`${c.dim}No collections found. Run 'qmd collection add .' to index markdown files.${c.reset}`);
+    }
+  } catch (err) {
+    console.error(`${c.yellow}${err instanceof Error ? err.message : String(err)}${c.reset}`);
+    process.exit(1);
   }
 }
 
@@ -1483,173 +1443,25 @@ function renderProgressBar(percent: number, width: number = 30): string {
 }
 
 async function vectorIndex(model: string = DEFAULT_EMBED_MODEL, force: boolean = false): Promise<void> {
-  const db = getDb();
-  const now = new Date().toISOString();
-
-  // If force, clear all vectors
-  if (force) {
-    console.log(`${c.yellow}Force re-indexing: clearing all vectors...${c.reset}`);
-    clearAllEmbeddings(db);
-  }
-
-  // Find unique hashes that need embedding (from active documents)
-  const hashesToEmbed = getHashesForEmbedding(db);
-
-  if (hashesToEmbed.length === 0) {
-    console.log(`${c.green}✓ All content hashes already have embeddings.${c.reset}`);
-    closeDb();
-    return;
-  }
-
-  // Prepare documents with chunks
-  type ChunkItem = { hash: string; title: string; text: string; seq: number; pos: number; tokens: number; bytes: number; displayName: string };
-  const allChunks: ChunkItem[] = [];
-  let multiChunkDocs = 0;
-
-  // Chunk all documents using actual token counts
-  process.stderr.write(`Chunking ${hashesToEmbed.length} documents by token count...\n`);
-  for (const item of hashesToEmbed) {
-    const encoder = new TextEncoder();
-    const bodyBytes = encoder.encode(item.body).length;
-    if (bodyBytes === 0) continue; // Skip empty
-
-    const title = extractTitle(item.body, item.path);
-    const displayName = item.path;
-    const chunks = await chunkDocumentByTokens(item.body);  // Uses actual tokenizer
-
-    if (chunks.length > 1) multiChunkDocs++;
-
-    for (let seq = 0; seq < chunks.length; seq++) {
-      allChunks.push({
-        hash: item.hash,
-        title,
-        text: chunks[seq]!.text, // Chunk is guaranteed to exist by seq loop
-        seq,
-        pos: chunks[seq]!.pos,
-        tokens: chunks[seq]!.tokens,
-        bytes: encoder.encode(chunks[seq]!.text).length,
-        displayName,
-      });
-    }
-  }
-
-  if (allChunks.length === 0) {
-    console.log(`${c.green}✓ No non-empty documents to embed.${c.reset}`);
-    closeDb();
-    return;
-  }
-
-  const totalBytes = allChunks.reduce((sum, chk) => sum + chk.bytes, 0);
-  const totalChunks = allChunks.length;
-  const totalDocs = hashesToEmbed.length;
-
-  console.log(`${c.bold}Embedding ${totalDocs} documents${c.reset} ${c.dim}(${totalChunks} chunks, ${formatBytes(totalBytes)})${c.reset}`);
-  if (multiChunkDocs > 0) {
-    console.log(`${c.dim}${multiChunkDocs} documents split into multiple chunks${c.reset}`);
-  }
-  console.log(`${c.dim}Model: ${model}${c.reset}\n`);
-
-  // Hide cursor during embedding
-  cursor.hide();
-
-  // Wrap all LLM embedding operations in a session for lifecycle management
-  // Use 30 minute timeout for large collections
-  await withLLMSession(async (session) => {
-    // Get embedding dimensions from first chunk
-    progress.indeterminate();
-    const firstChunk = allChunks[0];
-    if (!firstChunk) {
-      throw new Error("No chunks available to embed");
-    }
-    const firstText = formatDocForEmbedding(firstChunk.text, firstChunk.title);
-    const firstResult = await session.embed(firstText);
-    if (!firstResult) {
-      throw new Error("Failed to get embedding dimensions from first chunk");
-    }
-    ensureVecTable(db, firstResult.embedding.length);
-
-    let chunksEmbedded = 0, errors = 0, bytesProcessed = 0;
-    const startTime = Date.now();
-
-    // Batch embedding for better throughput
-    // Process in batches of 32 to balance memory usage and efficiency
-    const BATCH_SIZE = 32;
-
-    for (let batchStart = 0; batchStart < allChunks.length; batchStart += BATCH_SIZE) {
-      const batchEnd = Math.min(batchStart + BATCH_SIZE, allChunks.length);
-      const batch = allChunks.slice(batchStart, batchEnd);
-
-      // Format texts for embedding
-      const texts = batch.map(chunk => formatDocForEmbedding(chunk.text, chunk.title));
-
-      try {
-        // Batch embed all texts at once
-        const embeddings = await session.embedBatch(texts);
-
-        // Insert each embedding
-        for (let i = 0; i < batch.length; i++) {
-          const chunk = batch[i]!;
-          const embedding = embeddings[i];
-
-          if (embedding) {
-            insertEmbedding(db, chunk.hash, chunk.seq, chunk.pos, new Float32Array(embedding.embedding), model, now);
-            chunksEmbedded++;
-          } else {
-            errors++;
-            console.error(`\n${c.yellow}⚠ Error embedding "${chunk.displayName}" chunk ${chunk.seq}${c.reset}`);
-          }
-          bytesProcessed += chunk.bytes;
-        }
-      } catch (err) {
-        // If batch fails, try individual embeddings as fallback
-        for (const chunk of batch) {
-          try {
-            const text = formatDocForEmbedding(chunk.text, chunk.title);
-            const result = await session.embed(text);
-            if (result) {
-              insertEmbedding(db, chunk.hash, chunk.seq, chunk.pos, new Float32Array(result.embedding), model, now);
-              chunksEmbedded++;
-            } else {
-              errors++;
-            }
-          } catch (innerErr) {
-            errors++;
-            console.error(`\n${c.yellow}⚠ Error embedding "${chunk.displayName}" chunk ${chunk.seq}: ${innerErr}${c.reset}`);
-          }
-          bytesProcessed += chunk.bytes;
-        }
-      }
-
-      const percent = (bytesProcessed / totalBytes) * 100;
-      progress.set(percent);
-
-      const elapsed = (Date.now() - startTime) / 1000;
-      const bytesPerSec = bytesProcessed / elapsed;
-      const remainingBytes = totalBytes - bytesProcessed;
-      const etaSec = remainingBytes / bytesPerSec;
-
-      const bar = renderProgressBar(percent);
-      const percentStr = percent.toFixed(0).padStart(3);
-      const throughput = `${formatBytes(bytesPerSec)}/s`;
-      const eta = elapsed > 2 ? formatETA(etaSec) : "...";
-      const errStr = errors > 0 ? ` ${c.yellow}${errors} err${c.reset}` : "";
-
-      process.stderr.write(`\r${c.cyan}${bar}${c.reset} ${c.bold}${percentStr}%${c.reset} ${c.dim}${chunksEmbedded}/${totalChunks}${c.reset}${errStr} ${c.dim}${throughput} ETA ${eta}${c.reset}   `);
-    }
-
-    progress.clear();
-    cursor.show();
-    const totalTimeSec = (Date.now() - startTime) / 1000;
-    const avgThroughput = formatBytes(totalBytes / totalTimeSec);
-
-    console.log(`\r${c.green}${renderProgressBar(100)}${c.reset} ${c.bold}100%${c.reset}                                    `);
-    console.log(`\n${c.green}✓ Done!${c.reset} Embedded ${c.bold}${chunksEmbedded}${c.reset} chunks from ${c.bold}${totalDocs}${c.reset} documents in ${c.bold}${formatETA(totalTimeSec)}${c.reset} ${c.dim}(${avgThroughput}/s)${c.reset}`);
-    if (errors > 0) {
-      console.log(`${c.yellow}⚠ ${errors} chunks failed${c.reset}`);
-    }
-  }, { maxDuration: 30 * 60 * 1000, name: 'embed-command' });
-
   closeDb();
+  try {
+    const result = await runIndexerEmbedVectors(
+      {
+        dbPath: getDbPath(),
+        logger: {
+          info: (message: string) => console.log(message),
+          warn: (message: string) => console.log(`${c.yellow}${message}${c.reset}`),
+        },
+      },
+      { model, force }
+    );
+    if (result.documents === 0) {
+      console.log(`${c.green}✓ All content hashes already have embeddings.${c.reset}`);
+    }
+  } catch (err) {
+    console.error(`${c.yellow}${err instanceof Error ? err.message : String(err)}${c.reset}`);
+    process.exit(1);
+  }
 }
 
 // Sanitize a term for FTS5: remove punctuation except apostrophes
@@ -1956,6 +1768,56 @@ async function vectorSearch(query: string, opts: OutputOptions, _model: string =
   }, { maxDuration: 10 * 60 * 1000, name: 'vectorSearch' });
 }
 
+async function memoryVerify(configPathArg?: string): Promise<void> {
+  const { loadMemoryPluginConfigFromOpenClawFile, pluginConfigToApiRuntimeOverride } = await import("./openclaw-memory-config.js");
+
+  const configPath = configPathArg || "openclaw.json";
+  const pluginConfig = loadMemoryPluginConfigFromOpenClawFile(configPath, "qmd-memory");
+  const override = pluginConfigToApiRuntimeOverride(pluginConfig);
+
+  const checks: string[] = [];
+  const hasEmbedding = !!override.embedding?.baseUrl;
+  const hasRerank = !!override.rerank?.baseUrl;
+  const hasGenerate = !!override.generate?.baseUrl;
+
+  if (!hasEmbedding && !hasRerank && !hasGenerate) {
+    throw new Error(`No API endpoints configured in ${configPath}.`);
+  }
+
+  await withApiRuntimeConfig(override, async () => {
+    const llm = getDefaultLlamaCpp();
+
+    if (hasEmbedding) {
+      const embedded = await llm.embed("memory verify ping", { isQuery: true });
+      if (!embedded || !Array.isArray(embedded.embedding) || embedded.embedding.length === 0) {
+        throw new Error("Embedding API check failed.");
+      }
+      checks.push("embedding:ok");
+    }
+
+    if (hasRerank) {
+      const reranked = await llm.rerank("memory verify", [
+        { file: "a.md", text: "alpha memory entry" },
+        { file: "b.md", text: "beta unrelated" },
+      ]);
+      if (!reranked.results || reranked.results.length === 0) {
+        throw new Error("Rerank API check failed.");
+      }
+      checks.push("rerank:ok");
+    }
+
+    if (hasGenerate) {
+      const expanded = await llm.expandQuery("memory verify", { includeLexical: true });
+      if (!expanded || expanded.length === 0) {
+        throw new Error("Generate/expand API check failed.");
+      }
+      checks.push("generate:ok");
+    }
+  });
+
+  console.log(`${c.green}✓${c.reset} memory-verify passed (${checks.join(", ")})`);
+}
+
 async function querySearch(query: string, opts: OutputOptions, _embedModel: string = DEFAULT_EMBED_MODEL, _rerankModel: string = DEFAULT_RERANK_MODEL): Promise<void> {
   const store = getStore();
 
@@ -2024,6 +1886,9 @@ function parseCLI() {
         type: "string",
       },
       context: {
+        type: "string",
+      },
+      config: {
         type: "string",
       },
       "no-lex": {
@@ -2125,6 +1990,7 @@ function showHelp(): void {
   console.log("  qmd mcp --http [--port N]     - Start MCP server (HTTP transport, default port 8181)");
   console.log("  qmd mcp --http --daemon       - Start MCP server as background daemon");
   console.log("  qmd mcp stop                  - Stop background MCP daemon");
+  console.log("  qmd memory-verify [--config openclaw.json] - Verify API/hybrid memory model endpoints");
   console.log("");
   console.log("Global options:");
   console.log("  --index <name>             - Use custom index name (default: index)");
@@ -2385,6 +2251,12 @@ if (import.meta.main) {
       }
       await querySearch(cli.query, cli.opts);
       break;
+
+    case "memory-verify": {
+      const configPath = (cli.values.config as string | undefined) || cli.args[0];
+      await memoryVerify(configPath);
+      break;
+    }
 
     case "mcp": {
       const sub = cli.args[0]; // stop | status | undefined

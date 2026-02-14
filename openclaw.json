@@ -1,0 +1,57 @@
+{
+  "plugins": {
+    "slots": {
+      "memory": "qmd-memory"
+    },
+    "entries": {
+      "qmd-memory": {
+        "enabled": true,
+        "config": {
+          "index": {
+            "name": "memory",
+            "dbPath": "~/.openclaw/cache/qmd-memory/memory.sqlite",
+            "reuseQmdCache": false
+          },
+          "collections": {
+            "source": "workspace",
+            "paths": [
+              "~/.openclaw/workspace/memory",
+              "~/.openclaw/workspace/**/*.md"
+            ]
+          },
+          "models": {
+            "mode": "api",
+            "api": {
+              "embedding": {
+                "provider": "openai-compatible",
+                "timeoutMs": 30000,
+                "baseUrl": "https://embed-provider.example.com/v1",
+                "apiKeyEnv": "QMD_EMBED_API_KEY",
+                "model": "text-embedding-3-small"
+              },
+              "rerank": {
+                "provider": "openai-compatible",
+                "timeoutMs": 30000,
+                "baseUrl": "https://rerank-provider.example.com/v1",
+                "apiKeyEnv": "QMD_RERANK_API_KEY",
+                "model": "bge-reranker-v2-m3"
+              },
+              "generate": {
+                "provider": "openai-compatible",
+                "timeoutMs": 30000,
+                "baseUrl": "https://chat-provider.example.com/v1",
+                "apiKeyEnv": "QMD_GENERATE_API_KEY",
+                "model": "gpt-4o-mini"
+              }
+            }
+          },
+          "sync": {
+            "enabled": true,
+            "intervalSec": 300,
+            "embedOnSync": false
+          }
+        }
+      }
+    }
+  }
+}

@@ -4,19 +4,33 @@
  * Provides embeddings, text generation, and reranking using local GGUF models.
  */
 
-import {
-  getLlama,
-  resolveModelFile,
-  LlamaChatSession,
-  LlamaLogLevel,
-  type Llama,
-  type LlamaModel,
-  type LlamaEmbeddingContext,
-  type Token as LlamaToken,
+import type {
+  Llama,
+  LlamaModel,
+  LlamaEmbeddingContext,
+  Token as LlamaToken,
 } from "node-llama-cpp";
 import { homedir } from "os";
 import { join } from "path";
 import { existsSync, mkdirSync, statSync, unlinkSync, readdirSync, readFileSync, writeFileSync } from "fs";
+
+type LlamaRuntime = {
+  getLlama: (options: { logLevel: number }) => Promise<Llama>;
+  resolveModelFile: (modelUri: string, cacheDir: string) => Promise<string>;
+  LlamaChatSession: new (args: { contextSequence: unknown }) => {
+    prompt: (prompt: string, options: Record<string, unknown>) => Promise<string | void>;
+  };
+  LlamaLogLevel: { error: number };
+};
+
+let llamaRuntimePromise: Promise<LlamaRuntime> | null = null;
+
+async function getLlamaRuntime(): Promise<LlamaRuntime> {
+  if (!llamaRuntimePromise) {
+    llamaRuntimePromise = import("node-llama-cpp") as Promise<LlamaRuntime>;
+  }
+  return await llamaRuntimePromise;
+}
 
 // =============================================================================
 // Embedding Formatting Functions
@@ -186,6 +200,151 @@ export const DEFAULT_GENERATE_MODEL_URI = DEFAULT_GENERATE_MODEL;
 const MODEL_CACHE_DIR = join(homedir(), ".cache", "qmd", "models");
 export const DEFAULT_MODEL_CACHE_DIR = MODEL_CACHE_DIR;
 
+type ApiCapability = "embedding" | "rerank" | "generate";
+
+type ApiEndpointConfig = {
+  baseUrl: string;
+  model?: string;
+  apiKey?: string;
+  provider?: string;
+  timeoutMs: number;
+};
+
+type ApiRuntimeConfig = {
+  mode: "local" | "api" | "hybrid";
+  embedding?: ApiEndpointConfig;
+  rerank?: ApiEndpointConfig;
+  generate?: ApiEndpointConfig;
+};
+
+export type ApiRuntimeConfigOverride = {
+  mode?: "local" | "api" | "hybrid";
+  embedding?: Partial<ApiEndpointConfig>;
+  rerank?: Partial<ApiEndpointConfig>;
+  generate?: Partial<ApiEndpointConfig>;
+};
+
+let runtimeConfigOverride: ApiRuntimeConfig | null = null;
+
+function mergeRuntimeConfig(base: ApiRuntimeConfig, override: ApiRuntimeConfigOverride): ApiRuntimeConfig {
+  const mergeEndpoint = (origin?: ApiEndpointConfig, patch?: Partial<ApiEndpointConfig>): ApiEndpointConfig | undefined => {
+    if (!origin && !patch) return undefined;
+    const merged = {
+      baseUrl: patch?.baseUrl ?? origin?.baseUrl ?? "",
+      model: patch?.model ?? origin?.model,
+      apiKey: patch?.apiKey ?? origin?.apiKey,
+      provider: patch?.provider ?? origin?.provider,
+      timeoutMs: patch?.timeoutMs ?? origin?.timeoutMs ?? 30000,
+    };
+    if (!merged.baseUrl) return undefined;
+    return merged;
+  };
+
+  return {
+    mode: override.mode ?? base.mode,
+    embedding: mergeEndpoint(base.embedding, override.embedding),
+    rerank: mergeEndpoint(base.rerank, override.rerank),
+    generate: mergeEndpoint(base.generate, override.generate),
+  };
+}
+
+export async function withApiRuntimeConfig<T>(override: ApiRuntimeConfigOverride, fn: () => Promise<T>): Promise<T> {
+  const previous = runtimeConfigOverride;
+  runtimeConfigOverride = mergeRuntimeConfig(loadApiRuntimeConfig(), override);
+  try {
+    return await fn();
+  } finally {
+    runtimeConfigOverride = previous;
+  }
+}
+
+function getEnvMaybe(name: string): string | undefined {
+  const value = process.env[name];
+  if (!value) return undefined;
+  const trimmed = value.trim();
+  return trimmed.length > 0 ? trimmed : undefined;
+}
+
+function resolveApiKey(explicit?: string, keyEnvName?: string): string | undefined {
+  if (explicit && explicit.trim()) return explicit.trim();
+  if (keyEnvName && keyEnvName.trim()) {
+    return getEnvMaybe(keyEnvName.trim());
+  }
+  return undefined;
+}
+
+function normalizeBaseUrl(raw?: string): string | undefined {
+  const value = raw?.trim();
+  if (!value) return undefined;
+  return value.endsWith("/") ? value.slice(0, -1) : value;
+}
+
+function loadApiRuntimeConfig(): ApiRuntimeConfig {
+  const modeRaw = (getEnvMaybe("QMD_MODEL_MODE") || "local").toLowerCase();
+  const mode: "local" | "api" | "hybrid" =
+    modeRaw === "api" ? "api" : (modeRaw === "hybrid" ? "hybrid" : "local");
+
+  const defaultTimeout = Number.parseInt(getEnvMaybe("QMD_API_TIMEOUT_MS") || "30000", 10);
+  const defaultProvider = getEnvMaybe("QMD_API_PROVIDER") || "openai-compatible";
+
+  const makeEndpoint = (cap: "EMBED" | "RERANK" | "GENERATE", fallbackModel?: string): ApiEndpointConfig | undefined => {
+    const baseUrl = normalizeBaseUrl(getEnvMaybe(`QMD_API_${cap}_BASE_URL`));
+    if (!baseUrl) return undefined;
+    const model = getEnvMaybe(`QMD_API_${cap}_MODEL`) || fallbackModel;
+    const apiKey = resolveApiKey(
+      getEnvMaybe(`QMD_API_${cap}_KEY`),
+      getEnvMaybe(`QMD_API_${cap}_KEY_ENV`)
+    ) || getEnvMaybe("QMD_API_KEY");
+    const provider = getEnvMaybe(`QMD_API_${cap}_PROVIDER`) || defaultProvider;
+    const timeoutMs = Number.parseInt(getEnvMaybe(`QMD_API_${cap}_TIMEOUT_MS`) || String(defaultTimeout), 10);
+    return {
+      baseUrl,
+      model,
+      apiKey,
+      provider,
+      timeoutMs: Number.isFinite(timeoutMs) ? timeoutMs : 30000,
+    };
+  };
+
+  const loaded = {
+    mode,
+    embedding: makeEndpoint("EMBED"),
+    rerank: makeEndpoint("RERANK"),
+    generate: makeEndpoint("GENERATE"),
+  };
+  if (runtimeConfigOverride) {
+    return runtimeConfigOverride;
+  }
+  return loaded;
+}
+
+function shouldUseApiCapability(config: ApiRuntimeConfig, capability: ApiCapability): boolean {
+  if (config.mode === "local") return false;
+  if (config.mode === "api") return true;
+  if (capability === "embedding") return !!config.embedding;
+  if (capability === "rerank") return !!config.rerank;
+  return !!config.generate;
+}
+
+async function fetchJsonWithTimeout<T>(
+  url: string,
+  init: RequestInit,
+  timeoutMs: number,
+): Promise<T> {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(new Error(`Request timeout after ${timeoutMs}ms`)), timeoutMs);
+  try {
+    const response = await fetch(url, { ...init, signal: controller.signal });
+    if (!response.ok) {
+      const body = await response.text();
+      throw new Error(`HTTP ${response.status} ${response.statusText}: ${body}`);
+    }
+    return await response.json() as T;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
 export type PullResult = {
   model: string;
   path: string;
@@ -224,6 +383,16 @@ export async function pullModels(
   models: string[],
   options: { refresh?: boolean; cacheDir?: string } = {}
 ): Promise<PullResult[]> {
+  const runtime = loadApiRuntimeConfig();
+  if (runtime.mode === "api") {
+    return models.map((model) => ({
+      model,
+      path: "api://managed",
+      sizeBytes: 0,
+      refreshed: false,
+    }));
+  }
+
   const cacheDir = options.cacheDir || MODEL_CACHE_DIR;
   if (!existsSync(cacheDir)) {
     mkdirSync(cacheDir, { recursive: true });
@@ -264,7 +433,8 @@ export async function pullModels(
       }
     }
 
-    const path = await resolveModelFile(model, cacheDir);
+    const runtime = await getLlamaRuntime();
+    const path = await runtime.resolveModelFile(model, cacheDir);
     const sizeBytes = existsSync(path) ? statSync(path).size : 0;
     if (hfRef && filename) {
       const remoteEtag = await getRemoteEtag(hfRef);
@@ -377,6 +547,190 @@ export class LlamaCpp implements LLM {
 
   // Track disposal state to prevent double-dispose
   private disposed = false;
+
+  private getApiRuntimeConfig(): ApiRuntimeConfig {
+    return loadApiRuntimeConfig();
+  }
+
+  private buildApiHeaders(endpoint: ApiEndpointConfig): Record<string, string> {
+    const headers: Record<string, string> = {
+      "content-type": "application/json",
+    };
+    if (endpoint.apiKey) {
+      headers.authorization = `Bearer ${endpoint.apiKey}`;
+    }
+    return headers;
+  }
+
+  private async apiEmbedSingle(text: string, endpoint: ApiEndpointConfig): Promise<EmbeddingResult | null> {
+    type EmbeddingResp = {
+      data?: Array<{ embedding?: number[] }>;
+      model?: string;
+    };
+    const payload: Record<string, unknown> = {
+      input: text,
+    };
+    if (endpoint.model) payload.model = endpoint.model;
+
+    const resp = await fetchJsonWithTimeout<EmbeddingResp>(
+      `${endpoint.baseUrl}/embeddings`,
+      {
+        method: "POST",
+        headers: this.buildApiHeaders(endpoint),
+        body: JSON.stringify(payload),
+      },
+      endpoint.timeoutMs,
+    );
+    const vec = resp.data?.[0]?.embedding;
+    if (!Array.isArray(vec)) return null;
+    return {
+      embedding: vec,
+      model: resp.model || endpoint.model || endpoint.baseUrl,
+    };
+  }
+
+  private async apiEmbedBatch(texts: string[], endpoint: ApiEndpointConfig): Promise<(EmbeddingResult | null)[]> {
+    type EmbeddingResp = {
+      data?: Array<{ embedding?: number[] }>;
+      model?: string;
+    };
+    const payload: Record<string, unknown> = {
+      input: texts,
+    };
+    if (endpoint.model) payload.model = endpoint.model;
+
+    const resp = await fetchJsonWithTimeout<EmbeddingResp>(
+      `${endpoint.baseUrl}/embeddings`,
+      {
+        method: "POST",
+        headers: this.buildApiHeaders(endpoint),
+        body: JSON.stringify(payload),
+      },
+      endpoint.timeoutMs,
+    );
+    const arr = resp.data || [];
+    return texts.map((_, idx) => {
+      const vec = arr[idx]?.embedding;
+      if (!Array.isArray(vec)) return null;
+      return {
+        embedding: vec,
+        model: resp.model || endpoint.model || endpoint.baseUrl,
+      };
+    });
+  }
+
+  private async apiGenerate(prompt: string, options: GenerateOptions, endpoint: ApiEndpointConfig): Promise<GenerateResult | null> {
+    type ChatResp = {
+      model?: string;
+      choices?: Array<{ message?: { content?: string } }>;
+    };
+    const payload: Record<string, unknown> = {
+      messages: [{ role: "user", content: prompt }],
+      temperature: options.temperature ?? 0.7,
+      max_tokens: options.maxTokens ?? 150,
+    };
+    if (endpoint.model) payload.model = endpoint.model;
+
+    const resp = await fetchJsonWithTimeout<ChatResp>(
+      `${endpoint.baseUrl}/chat/completions`,
+      {
+        method: "POST",
+        headers: this.buildApiHeaders(endpoint),
+        body: JSON.stringify(payload),
+      },
+      endpoint.timeoutMs,
+    );
+    const text = resp.choices?.[0]?.message?.content;
+    if (typeof text !== "string") return null;
+    return {
+      text,
+      model: resp.model || endpoint.model || endpoint.baseUrl,
+      done: true,
+    };
+  }
+
+  private async apiExpandQuery(query: string, options: { context?: string; includeLexical?: boolean }, endpoint: ApiEndpointConfig): Promise<Queryable[]> {
+    const includeLexical = options.includeLexical ?? true;
+    const contextText = options.context ? `\nContext: ${options.context}` : "";
+    const prompt = [
+      "Return query expansions using one item per line in this exact format:",
+      "lex: ...",
+      "vec: ...",
+      "hyde: ...",
+      "Only return these lines.",
+      `Query: ${query}${contextText}`,
+    ].join("\n");
+
+    const generated = await this.apiGenerate(prompt, { maxTokens: 400, temperature: 0.7 }, endpoint);
+    const resultText = generated?.text || "";
+    const lines = resultText.trim().split("\n");
+    const parsed: Queryable[] = lines
+      .map((line) => {
+        const idx = line.indexOf(":");
+        if (idx < 0) return null;
+        const type = line.slice(0, idx).trim();
+        if (type !== "lex" && type !== "vec" && type !== "hyde") return null;
+        const text = line.slice(idx + 1).trim();
+        if (!text) return null;
+        return { type, text } as Queryable;
+      })
+      .filter((v): v is Queryable => v !== null);
+
+    if (parsed.length > 0) {
+      return includeLexical ? parsed : parsed.filter((q) => q.type !== "lex");
+    }
+
+    const fallback: Queryable[] = [{ type: "vec", text: query }];
+    if (includeLexical) fallback.unshift({ type: "lex", text: query });
+    return fallback;
+  }
+
+  private async apiRerank(query: string, documents: RerankDocument[], endpoint: ApiEndpointConfig): Promise<RerankResult> {
+    type RerankResp = {
+      model?: string;
+      results?: Array<{ index?: number; score?: number }>;
+      data?: Array<{ index?: number; relevance_score?: number; score?: number }>;
+    };
+
+    const payload: Record<string, unknown> = {
+      query,
+      documents: documents.map((d) => d.text),
+      top_n: documents.length,
+    };
+    if (endpoint.model) payload.model = endpoint.model;
+
+    const resp = await fetchJsonWithTimeout<RerankResp>(
+      `${endpoint.baseUrl}/rerank`,
+      {
+        method: "POST",
+        headers: this.buildApiHeaders(endpoint),
+        body: JSON.stringify(payload),
+      },
+      endpoint.timeoutMs,
+    );
+
+    const ranked = (resp.results || resp.data || [])
+      .map((item) => {
+        const index = typeof item.index === "number" ? item.index : -1;
+        const rawScore = typeof item.score === "number"
+          ? item.score
+          : (typeof item.relevance_score === "number" ? item.relevance_score : 0);
+        return { index, score: rawScore };
+      })
+      .filter((item) => item.index >= 0 && item.index < documents.length)
+      .sort((a, b) => b.score - a.score);
+
+    const results: RerankDocumentResult[] = ranked.map((item) => ({
+      file: documents[item.index]!.file,
+      score: item.score,
+      index: item.index,
+    }));
+
+    return {
+      results,
+      model: resp.model || endpoint.model || endpoint.baseUrl,
+    };
+  }
 
 
   constructor(config: LlamaCppConfig = {}) {
@@ -491,7 +845,8 @@ export class LlamaCpp implements LLM {
    */
   private async ensureLlama(): Promise<Llama> {
     if (!this.llama) {
-      this.llama = await getLlama({ logLevel: LlamaLogLevel.error });
+      const runtime = await getLlamaRuntime();
+      this.llama = await runtime.getLlama({ logLevel: runtime.LlamaLogLevel.error });
     }
     return this.llama;
   }
@@ -501,8 +856,8 @@ export class LlamaCpp implements LLM {
    */
   private async resolveModel(modelUri: string): Promise<string> {
     this.ensureModelCacheDir();
-    // resolveModelFile handles HF URIs and downloads to the cache dir
-    return await resolveModelFile(modelUri, this.modelCacheDir);
+    const runtime = await getLlamaRuntime();
+    return await runtime.resolveModelFile(modelUri, this.modelCacheDir);
   }
 
   /**
@@ -675,6 +1030,16 @@ export class LlamaCpp implements LLM {
   // ==========================================================================
 
   async embed(text: string, options: EmbedOptions = {}): Promise<EmbeddingResult | null> {
+    const runtime = this.getApiRuntimeConfig();
+    if (shouldUseApiCapability(runtime, "embedding") && runtime.embedding) {
+      try {
+        return await this.apiEmbedSingle(text, runtime.embedding);
+      } catch (error) {
+        console.error("Embedding API error:", error);
+        if (runtime.mode === "api") return null;
+      }
+    }
+
     // Ping activity at start to keep models alive during this operation
     this.touchActivity();
 
@@ -697,6 +1062,16 @@ export class LlamaCpp implements LLM {
    * Uses Promise.all for parallel embedding - node-llama-cpp handles batching internally
    */
   async embedBatch(texts: string[]): Promise<(EmbeddingResult | null)[]> {
+    const runtime = this.getApiRuntimeConfig();
+    if (shouldUseApiCapability(runtime, "embedding") && runtime.embedding) {
+      try {
+        return await this.apiEmbedBatch(texts, runtime.embedding);
+      } catch (error) {
+        console.error("Batch embedding API error:", error);
+        if (runtime.mode === "api") return texts.map(() => null);
+      }
+    }
+
     // Ping activity at start to keep models alive during this operation
     this.touchActivity();
 
@@ -730,6 +1105,16 @@ export class LlamaCpp implements LLM {
   }
 
   async generate(prompt: string, options: GenerateOptions = {}): Promise<GenerateResult | null> {
+    const runtime = this.getApiRuntimeConfig();
+    if (shouldUseApiCapability(runtime, "generate") && runtime.generate) {
+      try {
+        return await this.apiGenerate(prompt, options, runtime.generate);
+      } catch (error) {
+        console.error("Generate API error:", error);
+        if (runtime.mode === "api") return null;
+      }
+    }
+
     // Ping activity at start to keep models alive during this operation
     this.touchActivity();
 
@@ -739,7 +1124,8 @@ export class LlamaCpp implements LLM {
     // Create fresh context -> sequence -> session for each call
     const context = await this.generateModel!.createContext();
     const sequence = context.getSequence();
-    const session = new LlamaChatSession({ contextSequence: sequence });
+    const llamaRuntime = await getLlamaRuntime();
+    const session = new llamaRuntime.LlamaChatSession({ contextSequence: sequence });
 
     const maxTokens = options.maxTokens ?? 150;
     // Qwen3 recommends temp=0.7, topP=0.8, topK=20 for non-thinking mode
@@ -770,6 +1156,13 @@ export class LlamaCpp implements LLM {
   }
 
   async modelExists(modelUri: string): Promise<ModelInfo> {
+    const runtime = this.getApiRuntimeConfig();
+    if (runtime.mode !== "local") {
+      if (runtime.embedding?.model === modelUri || runtime.rerank?.model === modelUri || runtime.generate?.model === modelUri) {
+        return { name: modelUri, exists: true, path: "api://managed" };
+      }
+    }
+
     // For HuggingFace URIs, we assume they exist
     // For local paths, check if file exists
     if (modelUri.startsWith("hf:")) {
@@ -789,6 +1182,20 @@ export class LlamaCpp implements LLM {
   // ==========================================================================
 
   async expandQuery(query: string, options: { context?: string, includeLexical?: boolean } = {}): Promise<Queryable[]> {
+    const runtime = this.getApiRuntimeConfig();
+    if (shouldUseApiCapability(runtime, "generate") && runtime.generate) {
+      try {
+        return await this.apiExpandQuery(query, options, runtime.generate);
+      } catch (error) {
+        console.error("Structured query expansion API failed:", error);
+        if (runtime.mode === "api") {
+          const fallback: Queryable[] = [{ type: 'vec', text: query }];
+          if ((options.includeLexical ?? true)) fallback.unshift({ type: 'lex', text: query });
+          return fallback;
+        }
+      }
+    }
+
     // Ping activity at start to keep models alive during this operation
     this.touchActivity();
 
@@ -812,7 +1219,8 @@ export class LlamaCpp implements LLM {
     // Create fresh context for each call
     const genContext = await this.generateModel!.createContext();
     const sequence = genContext.getSequence();
-    const session = new LlamaChatSession({ contextSequence: sequence });
+    const llamaRuntime = await getLlamaRuntime();
+    const session = new llamaRuntime.LlamaChatSession({ contextSequence: sequence });
 
     try {
       // Qwen3 recommended settings for non-thinking mode:
@@ -876,6 +1284,21 @@ export class LlamaCpp implements LLM {
     documents: RerankDocument[],
     options: RerankOptions = {}
   ): Promise<RerankResult> {
+    const runtime = this.getApiRuntimeConfig();
+    if (shouldUseApiCapability(runtime, "rerank") && runtime.rerank) {
+      try {
+        return await this.apiRerank(query, documents, runtime.rerank);
+      } catch (error) {
+        console.error("Rerank API error:", error);
+        if (runtime.mode === "api") {
+          return {
+            model: runtime.rerank.model || runtime.rerank.baseUrl,
+            results: documents.map((doc, index) => ({ file: doc.file, index, score: 0 })),
+          };
+        }
+      }
+    }
+
     // Ping activity at start to keep models alive during this operation
     this.touchActivity();
 
